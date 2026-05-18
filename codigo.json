@@ -1,0 +1,41 @@
+buildSwapV2Data(iface, methods, side, isNative, amountIn, amountOutMin, path, recipient, deadline) {
+        if (side === 'buy') {
+            const buyMethod = isNative ? methods.buy : 'swapExactTokensForTokensSupportingFeeOnTransferTokens';
+            if (isNative && buyMethod === 'swapExactETHForTokensSupportingFeeOnTransferTokens') {
+                return iface.encodeFunctionData(buyMethod, [amountOutMin, path, recipient, deadline]);
+            }
+            return iface.encodeFunctionData(buyMethod, [amountIn, amountOutMin, path, recipient, deadline]);
+        } else {
+            const sellMethod = isNative ? methods.sell : 'swapExactTokensForTokensSupportingFeeOnTransferTokens';
+            return iface.encodeFunctionData(sellMethod, [amountIn, amountOutMin, path, recipient, deadline]);
+        }
+    }
+
+    async buildSwapV2Tx(amount, tokenMainInfo, routerAddress, wallet, path, gwei, slippage, side = 'buy', methods = null) {
+        const iface = new ethers.Interface(this.v2Router);
+        const deadline = Math.floor(Date.now() / 1000) + 600;
+        // Verificamos si el par involucra al token nativo (WBNB/WETH)
+        const isNative = path[0].toLowerCase() === this.mainToken.toLowerCase() || path[path.length - 1].toLowerCase() === this.mainToken.toLowerCase();
+        const amountIn = side === 'buy' ? ethers.parseUnits(amount, tokenMainInfo.decimals) : amount;
+        const [amountOut, nonce, estimatedGas] = await Promise.all([
+            this.quoteService.getV2Quote(routerAddress, path, amountIn).then(res => res.amountOut).catch(() => 0n),
+            wallet.getNonce(),
+            this.provider.estimateGas({
+                from: DEAD_ADDRESS,
+                to: routerAddress,
+                data: this.buildSwapV2Data(iface, methods, side, isNative, amountIn, 0n, path, wallet.address, deadline),
+                ...(side === 'buy' && isNative ? { value: amountIn } : {})
+            }).catch(() => 1500000n)
+        ]);
+        const amountOutMin = new Decimal(amountOut.toString()).mul(100 - slippage).div(100).toFixed(0);
+        const data = this.buildSwapV2Data(iface, methods, side, isNative, amountIn, amountOutMin, path, wallet.address, deadline);
+        return {
+            to: routerAddress,
+            gasLimit: BigInt(Decimal(estimatedGas.toString()).mul(1.35).toFixed(0)),
+            gasPrice: ethers.parseUnits(String(gwei), 'gwei'),
+            nonce,
+            data,
+            chainId: this.chainId,
+            ...(side === 'buy' && isNative ? { value: amountIn } : {})
+        };
+    }
