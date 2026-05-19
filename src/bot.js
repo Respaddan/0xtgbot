@@ -1,12 +1,13 @@
 import { Telegraf } from 'telegraf';
 import { ethers } from 'ethers';
 import { config } from './config.js';
-import { getTokenInfo, withTimeout, resetReadProvider, warmup } from './chain.js';
+import { getTokenInfo, withTimeout, resetReadProvider, warmup, startBlockWatcher } from './chain.js';
 import { executeBuy, executeSell } from './swap.js';
 import { renderPanel, renderKeyboard, renderSellResult, closeExtra } from './ui.js';
 import { authMiddleware, isOwner } from './auth.js';
 import { getSignerFor, setUserWallet, removeUserWallet, getUserAddress } from './wallets.js';
 import { getPosition, recordBuy, recordSell, resetPosition, computePnl } from './positions.js';
+import { makeTrace } from './trace.js';
 
 // Dirección de wallet del usuario para mostrar balances (o null si no tiene).
 function walletOf(userId) {
@@ -193,9 +194,10 @@ async function rerenderByKey(telegram, key, state) {
 const pendingInput = new Map();
 
 async function doBuy(ctx, userId, state, key, amount) {
+  const tr = makeTrace(`COMPRA ${amount} BNB ${state.info?.symbol || ''}`);
   const signer = getSignerFor(userId);
   const { hash, tokensReceived, bnbSpent, approveHash } =
-    await executeBuy(signer, state.info, String(amount), state.slipBuy, state.gwei);
+    await executeBuy(signer, state.info, String(amount), state.slipBuy, state.gwei, tr);
   recordBuy(userId, state.token, bnbSpent, tokensReceived);
   const lines = [
     `🟢 *Compra ejecutada*`,
@@ -204,23 +206,32 @@ async function doBuy(ctx, userId, state, key, amount) {
     `[Tx](https://bscscan.com/tx/${hash})`,
   ];
   if (approveHash) lines.push(`🔓 Approve: [Tx](https://bscscan.com/tx/${approveHash})`);
-  await ctx.reply(lines.join('\n'), closeExtra());
+  // Mensaje de resultado y refresh del panel EN PARALELO (post-trade).
+  const replyP = ctx.reply(lines.join('\n'), closeExtra())
+    .then(() => tr.log('mensaje de resultado enviado a Telegram'));
   await refreshState(userId, state).catch(() => {});
   await rerenderByKey(ctx.telegram, key, state);
+  await replyP.catch(() => {});
+  tr.log('panel actualizado — FIN');
 }
 
 async function doSell(ctx, userId, state, key, pct) {
+  const tr = makeTrace(`VENTA ${pct}% ${state.info?.symbol || ''}`);
   const signer = getSignerFor(userId);
   const { hash, approveHash, bnbReceived, tokensSold, soldAll } =
-    await executeSell(signer, state.info, pct, state.slipSell, state.gwei);
+    await executeSell(signer, state.info, pct, state.slipSell, state.gwei, tr);
   recordSell(userId, state.token, tokensSold, bnbReceived);
   if (soldAll) resetPosition(userId, state.token);
   const { text, extra } = renderSellResult({
     symbol: state.info.symbol, percent: pct, bnbReceived, hash, approveHash,
   });
-  await ctx.reply(text, extra);
+  // Mensaje de resultado y refresh del panel EN PARALELO (post-trade).
+  const replyP = ctx.reply(text, extra)
+    .then(() => tr.log('mensaje de resultado enviado a Telegram'));
   await refreshState(userId, state).catch(() => {});
   await rerenderByKey(ctx.telegram, key, state);
+  await replyP.catch(() => {});
+  tr.log('panel actualizado — FIN');
 }
 
 bot.on('callback_query', async (ctx) => {
@@ -322,6 +333,9 @@ warmup()
     ? `🔥 Conexión caliente — BNB $${bnb.toFixed(2)}`
     : '⚠️ Warmup falló (se reintenta al primer uso)'))
   .catch(() => {});
+
+// Watcher de bloque en background: getCachedBlockNumber() = 0 RPC al comprar.
+startBlockWatcher(300);
 
 // dropPendingUpdates: ignora lo acumulado mientras estuvo apagado.
 bot.launch({ dropPendingUpdates: true }).catch((e) =>

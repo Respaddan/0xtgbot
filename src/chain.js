@@ -54,6 +54,53 @@ export function getWssProvider() {
   return wssProvider;
 }
 
+// Providers para "carrera": el quote se pide a varios y gana el 1ro que
+// responda → corta los picos de cola de un solo RPC lento.
+let raceProviders;
+export function getRaceProviders() {
+  if (!raceProviders) {
+    const opts = { staticNetwork: ethers.Network.from(config.chainId) };
+    const urls = [
+      config.httpRpc,                 // blxrbdn
+      'https://bsc-dataseed.bnbchain.org',
+      config.httpReadRpc,             // publicnode http
+    ];
+    raceProviders = urls.map((u) => new ethers.JsonRpcProvider(u, config.chainId, opts));
+  }
+  return raceProviders;
+}
+
+// Ejecuta fn(provider) en todos los race providers; devuelve el 1er éxito.
+export async function raceRead(fn) {
+  const ps = getRaceProviders().map((p) => fn(p));
+  return Promise.any(ps);
+}
+
+// --- Block number cacheado en background (0 RPC en el hot path) ---
+let lastBlock = 0;
+let blockWatcher = null;
+
+export function startBlockWatcher(intervalMs = 300) {
+  if (blockWatcher) return;
+  const tick = async () => {
+    try {
+      const b = await getWriteProvider().getBlockNumber();
+      if (b > lastBlock) lastBlock = b;
+    } catch { /* reintenta al próximo tick */ }
+  };
+  tick();
+  blockWatcher = setInterval(tick, intervalMs);
+  blockWatcher.unref?.();
+}
+
+// Bloque actual sin pagar RPC (usa el cache del watcher). Si aún no hay
+// cache, hace una lectura puntual de respaldo.
+export async function getCachedBlockNumber() {
+  if (lastBlock) return lastBlock;
+  try { lastBlock = await getWriteProvider().getBlockNumber(); } catch { /* 0 */ }
+  return lastBlock;
+}
+
 // Corta cualquier lectura colgada para que el bot nunca se quede pegado.
 export async function withTimeout(promise, ms, label = 'RPC') {
   let t;

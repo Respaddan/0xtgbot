@@ -67,6 +67,9 @@ export const config = {
 
   DEAD_ADDRESS: '0x000000000000000000000000000000000000dEaD',
 
+  // Gas FIJO (sin estimateGas → 1 RPC menos y sin fallo en fee-on-transfer).
+  gasLimit: Number(process.env.GAS_LIMIT || 500000),
+
   // Valores por defecto del panel
   defaults: {
     slippageBuy: 10,   // %

@@ -47,12 +47,23 @@ export async function sendBundle(txs, currentBlock, plusBlock = config.bundleBlo
   } else {
     jobs.push(sendBlockRazor(txs, maxBlock), sendPuissant(txs, maxBlock));
   }
-  const results = await Promise.allSettled(jobs);
-  const ok = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
-  const errs = results.filter((r) => r.status === 'rejected').map((r) => r.reason?.message || String(r.reason));
-  if (ok.length === 0) {
+  // First-win: resolvemos en cuanto UN relay acepta; los demás siguen en
+  // background (la tx igual les llegó → misma protección, sin esperar al lento).
+  const accepted = [];
+  const errs = [];
+  const tracked = jobs.map((j) =>
+    j.then((v) => { accepted.push(v.relay); return v; })
+     .catch((e) => { errs.push(e?.message || String(e)); throw e; })
+  );
+
+  try {
+    const first = await Promise.any(tracked);
+    // Los otros relays terminan en background (logueamos errores tardíos).
+    Promise.allSettled(tracked).then(() => {
+      if (errs.length) console.warn('[bundle] relay(s) con error:', errs.join(' | '));
+    });
+    return { accepted: [first.relay], maxBlock };
+  } catch {
     throw new Error(`Ningún relay aceptó el bundle: ${errs.join(' | ')}`);
   }
-  if (errs.length) console.warn('[bundle] relay(s) con error:', errs.join(' | '));
-  return { accepted: ok.map((o) => o.relay), maxBlock };
 }
