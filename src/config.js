@@ -22,13 +22,25 @@ export const config = {
 
   // --- Envío de tx en BUNDLE (firma local + eth_sendBundle a relays MEV) ---
   useBundle: process.env.USE_BUNDLE !== 'false',          // default: activado
-  bundleBlocks: Number(process.env.BUNDLE_BLOCKS || 2),   // ventana maxBlockNumber = bloque + N
+  // Ventana que se le da al RELAY (maxBlockNumber = bloque + N). Generosa
+  // para tolerar desfase entre nodos y que el relay acepte/tenga chances.
+  bundleBlocks: Number(process.env.BUNDLE_BLOCKS || 5),
+  // Tras cuántos bloques (observados) disparamos el fallback público.
+  // Independiente de bundleBlocks → el fallback sigue siendo rápido.
+  bundleFallbackBlocks: Number(process.env.BUNDLE_FALLBACK_BLOCKS || 1),
+  // Modo de fallback:
+  //  'blocks'  -> espera N bloques (BUNDLE_FALLBACK_BLOCKS) y si no entró, público
+  //  'instant' -> manda a bundle Y a mempool público a la vez (máx velocidad, sin MEV)
+  fallbackMode: (process.env.FALLBACK_MODE || 'blocks').trim().toLowerCase(),
   // Duración de bloque en BSC (~0.75s post-Maxwell). Para calcular el fallback.
   blockMs: Number(process.env.BSC_BLOCK_MS || 750),
   relays: {
     blockRazor: process.env.BLOCKRAZOR_URL || 'https://rpc.blockrazor.builders',
     puissant: process.env.PUISSANT_URL || 'https://puissant-bsc.48.club',
   },
+  // Diagnóstico: 'blockrazor' o 'puissant' para mandar SOLO a ese relay
+  // (así la atribución es 100% segura). Vacío = ambos (normal).
+  onlyRelay: (process.env.ONLY_RELAY || '').trim().toLowerCase(),
   // Si el bundle no entra en su ventana, reenvía la MISMA tx firmada al
   // mempool público para no perder la operación (reintroduce algo de riesgo
   // MEV; ponlo en 'false' para bundle estricto).

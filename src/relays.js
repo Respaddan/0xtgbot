@@ -36,10 +36,18 @@ export function sendPuissant(txs, maxBlock) {
  */
 export async function sendBundle(txs, currentBlock, plusBlock = config.bundleBlocks) {
   const maxBlock = Number(currentBlock) + Number(plusBlock);
-  const results = await Promise.allSettled([
-    sendBlockRazor(txs, maxBlock),
-    sendPuissant(txs, maxBlock),
-  ]);
+
+  // Modo diagnóstico: enviar SOLO a un relay.
+  const only = config.onlyRelay;
+  const jobs = [];
+  if (only === 'blockrazor') {
+    jobs.push(sendBlockRazor(txs, maxBlock));
+  } else if (only === 'puissant') {
+    jobs.push(sendPuissant(txs, maxBlock));
+  } else {
+    jobs.push(sendBlockRazor(txs, maxBlock), sendPuissant(txs, maxBlock));
+  }
+  const results = await Promise.allSettled(jobs);
   const ok = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
   const errs = results.filter((r) => r.status === 'rejected').map((r) => r.reason?.message || String(r.reason));
   if (ok.length === 0) {

@@ -5,6 +5,21 @@ import { ERC20_ABI, ROUTER_V2_ABI } from './abis.js';
 import { getReadProvider, getWriteProvider } from './chain.js';
 import { sendBundle } from './relays.js';
 
+// Espera el receipt poll-eando rápido el endpoint más veloz (blxrbdn).
+// Mejor que el push WSS en la práctica: ~POLL_MS de gap, endpoint más rápido.
+const POLL_MS = 250;
+async function waitForReceipt(provider, hash, timeoutMs = 90_000) {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    try {
+      const r = await provider.getTransactionReceipt(hash);
+      if (r) return r;
+    } catch { /* reintenta */ }
+    await new Promise((r) => setTimeout(r, POLL_MS));
+  }
+  return null;
+}
+
 /**
  * Firma la tx localmente y la envía:
  *  - si useBundle: eth_sendBundle a los relays MEV (tx privada, anti-sandwich)
@@ -12,30 +27,46 @@ import { sendBundle } from './relays.js';
  * Devuelve { hash, wait } compatible con el flujo anterior.
  */
 async function signAndSend(wallet, tx) {
-  const provider = getWriteProvider();
-  const full = { ...tx, type: 0 }; // BSC = legacy (type 0)
+  const rp = getWriteProvider();        // blxrbdn: lecturas/espera/envío (más rápido + Protect)
+  const full = { ...tx, type: 0 };      // BSC = legacy (type 0)
   delete full.from;
 
   const raw = await wallet.signTransaction(full);
-  const hash = ethers.Transaction.from(raw).hash;
+  const parsed = ethers.Transaction.from(raw);
+  const hash = parsed.hash;
+  const nonce = parsed.nonce;
+
+  // Cómo terminó entrando la tx (para el log al confirmar).
+  const route = { via: null, accepted: [] };
+  let submitBlock = 0;
 
   if (config.useBundle) {
-    const blk = await provider.getBlockNumber();
+    const blk = await rp.getBlockNumber().catch(() => 0);
+    submitBlock = blk;
     const info = await sendBundle([raw], blk, config.bundleBlocks);
-    console.log(`[bundle] ${hash} → ${info.accepted.join(', ')} (maxBlock ${info.maxBlock})`);
+    route.accepted = info.accepted;
+    console.log(`[bundle] enviado ${hash} | nonce ${nonce} | aceptado por ${info.accepted.join(', ')} (bloque ${blk}, maxBlock ${info.maxBlock})`);
 
-    // Fallback consciente de bloques: en cuanto el bloque actual supera la
-    // ventana del bundle sin haber entrado, manda al mempool público YA.
-    if (config.bundlePublicFallback) {
+    if (config.fallbackMode === 'instant') {
+      // MÁX VELOCIDAD: en paralelo al bundle, vía blxrbdn Protect RPC
+      // (BSC Chain 56) → NO va al mempool P2P público, sigue MEV-protegido.
+      route.via = 'bundle + blxrbdn Protect (instant)';
+      await rp.broadcastTransaction(raw).catch(() => {});
+      console.log(`[bundle] ⚡ instant: enviado también vía blxrbdn Protect RPC: ${hash}`);
+    } else if (config.bundlePublicFallback) {
+      // Fallback rápido: a los N bloques observados, sin esperar al maxBlock.
+      const fallbackAt = blk + config.bundleFallbackBlocks;
       (async () => {
-        const hardLimit = Date.now() + config.bundleFallbackMs + 2000;
+        const hardLimit = Date.now() + config.bundleFallbackMs + 3000;
         while (Date.now() < hardLimit) {
           await new Promise((r) => setTimeout(r, 300));
           try {
-            if (await provider.getTransactionReceipt(hash)) return; // ya entró
-            if ((await provider.getBlockNumber()) > info.maxBlock) {
-              await provider.broadcastTransaction(raw).catch(() => {});
-              console.log(`[bundle] fallback público (ventana agotada): ${hash}`);
+            if (await rp.getTransactionReceipt(hash)) return; // ya entró (bundle)
+            const cur = await rp.getBlockNumber().catch(() => 0);
+            if (cur > fallbackAt) {
+              route.via = 'fallback blxrbdn Protect';
+              await rp.broadcastTransaction(raw).catch(() => {});
+              console.log(`[bundle] ⏬ no entró en ${config.bundleFallbackBlocks} bloque(s), fallback vía blxrbdn Protect RPC: ${hash}`);
               return;
             }
           } catch { /* reintenta */ }
@@ -43,12 +74,44 @@ async function signAndSend(wallet, tx) {
       })();
     }
   } else {
-    await provider.broadcastTransaction(raw);
+    route.via = 'blxrbdn Protect (sin bundle)';
+    await rp.broadcastTransaction(raw);
+    console.log(`[tx] enviado vía blxrbdn Protect RPC: ${hash} | nonce ${nonce}`);
   }
 
   return {
     hash,
-    wait: (conf = 1) => provider.waitForTransaction(hash, conf, 90_000),
+    nonce,
+    wait: async () => {
+      const r = await waitForReceipt(rp, hash, 90_000);
+      if (r) {
+        let via;
+        if (route.via) {
+          via = route.via; // 'fallback público' o 'mempool (sin bundle)'
+        } else if (route.accepted.length === 1) {
+          via = `bundle ✅ ${route.accepted[0]}`; // solo un relay aceptó → atribuible
+        } else {
+          via = `bundle ✅ ${route.accepted.join('/')} (no atribuible a uno)`;
+        }
+        const ok = r.status === 1 ? 'OK' : 'REVERTED ⚠️';
+        const pos = r.index ?? r.transactionIndex; // posición de la tx en el bloque
+        const delta = submitBlock ? r.blockNumber - submitBlock : null;
+
+        // Solo en modo instant: heurística (NO certeza) de por dónde entró.
+        let guess = '';
+        if (config.fallbackMode === 'instant' && config.useBundle) {
+          const likelyBundle = delta != null && delta <= 1 && pos <= 8;
+          guess = likelyBundle
+            ? ' | ≈probable BUNDLE relay (rápido + pos baja, heurística)'
+            : ' | ≈probable blxrbdn Protect (tardó/pos alta, heurística)';
+        }
+        const dly = delta != null ? ` | +${delta} bloque(s)` : '';
+        console.log(`[tx] confirmada vía ${via} | nonce ${nonce} | bloque ${r.blockNumber}${dly} | pos ${pos} en bloque | ${ok}${guess} | ${hash}`);
+      } else {
+        console.log(`[tx] ⚠️ sin receipt tras timeout: ${hash} | nonce ${nonce}`);
+      }
+      return r;
+    },
   };
 }
 
@@ -89,9 +152,10 @@ async function buildSwapV2Tx({ amountIn, decimals, path, gwei, slippage, side, w
 
   const writeProvider = getWriteProvider();
 
-  const [quote, nonce, estimatedGas] = await Promise.all([
+  const [quote, nWrite, nRead, estimatedGas] = await Promise.all([
     getV2Quote(routerAddress, path, amountIn).then((r) => r.amountOut).catch(() => 0n),
-    wallet.getNonce(),
+    writeProvider.getTransactionCount(wallet.address, 'pending').catch(() => 0),
+    getReadProvider().getTransactionCount(wallet.address, 'pending').catch(() => 0),
     writeProvider.estimateGas({
       from: wallet.address,
       to: routerAddress,
@@ -99,6 +163,9 @@ async function buildSwapV2Tx({ amountIn, decimals, path, gwei, slippage, side, w
       ...(side === 'buy' && isNative ? { value: amountIn } : {}),
     }).catch(() => 1_500_000n),
   ]);
+
+  // Nonce PENDING y de la fuente más adelantada (evita "nonce too low").
+  const nonce = Math.max(Number(nWrite), Number(nRead));
 
   const amountOutMin = BigInt(
     new Decimal(quote.toString()).mul(100 - slippage).div(100).toFixed(0)

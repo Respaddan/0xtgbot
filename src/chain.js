@@ -39,6 +39,21 @@ export function resetReadProvider() {
   readProvider = null;
 }
 
+// Provider WSS dedicado para enviar/esperar tx (block number, receipt,
+// waitForTransaction, broadcast). WSS = push, más rápido que pollear HTTPS.
+let wssProvider;
+export function getWssProvider() {
+  if (!wssProvider) {
+    wssProvider = new ethers.WebSocketProvider(config.wssRpc, config.chainId);
+    try {
+      const drop = () => { wssProvider = null; };
+      wssProvider.websocket.addEventListener?.('close', drop);
+      wssProvider.websocket.addEventListener?.('error', drop);
+    } catch { /* algunas versiones no exponen websocket aún */ }
+  }
+  return wssProvider;
+}
+
 // Corta cualquier lectura colgada para que el bot nunca se quede pegado.
 export async function withTimeout(promise, ms, label = 'RPC') {
   let t;
