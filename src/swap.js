@@ -153,6 +153,30 @@ function buildSwapV2Data(iface, methods, side, isNative, amountIn, amountOutMin,
   return iface.encodeFunctionData(sellMethod, [amountIn, amountOutMin, path, recipient, deadline]);
 }
 
+// Nonce PENDING más adelantado (write vs read) — evita "nonce too low".
+async function pendingNonce(wallet) {
+  const [nW, nR] = await Promise.all([
+    getWriteProvider().getTransactionCount(wallet.address, 'pending').catch(() => 0),
+    getReadProvider().getTransactionCount(wallet.address, 'pending').catch(() => 0),
+  ]);
+  return Math.max(Number(nW), Number(nR));
+}
+
+// Tx de approve(router, MaxUint256) lista para signAndSend (mismo camino
+// rápido que compra/venta: bundle + fallback + poll 250ms).
+async function buildApproveTx(wallet, tokenAddr, gwei) {
+  const iface = new ethers.Interface(ERC20_ABI);
+  const nonce = await pendingNonce(wallet);
+  return {
+    to: tokenAddr,
+    gasLimit: BigInt(config.gasLimit),
+    gasPrice: ethers.parseUnits(String(gwei), 'gwei'),
+    nonce,
+    data: iface.encodeFunctionData('approve', [config.PANCAKE_V2_ROUTER, ethers.MaxUint256]),
+    chainId: config.chainId,
+  };
+}
+
 async function buildSwapV2Tx({ amountIn, decimals, path, gwei, slippage, side, wallet, tr = noTrace }) {
   const iface = new ethers.Interface(ROUTER_V2_ABI);
   const routerAddress = config.PANCAKE_V2_ROUTER;
@@ -195,7 +219,7 @@ async function buildSwapV2Tx({ amountIn, decimals, path, gwei, slippage, side, w
 const approvedCache = new Set();
 const akey = (w, t) => `${w.toLowerCase()}:${t.toLowerCase()}`;
 
-async function ensureAllowance(wallet, tokenAddr, amountIn, tr = noTrace, { waitConfirm = true } = {}) {
+async function ensureAllowance(wallet, tokenAddr, amountIn, tr = noTrace, { waitConfirm = true, gwei = config.defaults.gwei } = {}) {
   const k = akey(wallet.address, tokenAddr);
   if (approvedCache.has(k)) { tr.log('approve NO necesario (cache)'); return null; }
 
@@ -206,21 +230,22 @@ async function ensureAllowance(wallet, tokenAddr, amountIn, tr = noTrace, { wait
     tr.log('approve NO necesario (allowance suficiente, incl. otro bot)');
     return null;
   }
-  tr.log('approve necesario: enviando approve…');
-  const tx = await token.approve(config.PANCAKE_V2_ROUTER, ethers.MaxUint256);
+  // Approve por el MISMO camino rápido que compra/venta (bundle + poll 250ms).
+  tr.log('approve necesario: enviando approve (vía bundle)…');
+  const atx = await buildApproveTx(wallet, tokenAddr, gwei);
+  const sent = await signAndSend(wallet, atx, tr);
   approvedCache.add(k); // optimista
 
   if (waitConfirm) {
-    await tx.wait();
-    tr.log(`approve confirmado (${tx.hash.slice(0, 12)}…)`);
+    await sent.wait();
   } else {
     // No bloqueamos la compra: el approve confirma en background.
-    tr.log(`approve enviado, NO se espera (${tx.hash.slice(0, 12)}…)`);
-    tx.wait()
-      .then(() => tr.log('approve confirmado (background)'))
+    tr.log(`approve enviado, NO se espera (${sent.hash.slice(0, 12)}…)`);
+    sent.wait()
+      .then((r) => { if (!r || r.status !== 1) { approvedCache.delete(k); tr.log('approve FALLÓ (bg) — cache revertido'); } })
       .catch(() => { approvedCache.delete(k); tr.log('approve FALLÓ (bg) — cache revertido'); });
   }
-  return tx.hash;
+  return sent.hash;
 }
 
 /**
@@ -248,7 +273,7 @@ export async function executeBuy(wallet, tokenInfo, amountBnb, slippage, gwei, t
 
   // Approve post-compra SIN bloquear: confirma en background (la venta futura
   // igual queda preparada; si vendes antes de que mine, la venta lo resuelve).
-  const approveHash = await ensureAllowance(wallet, tokenInfo.address, balAfter, tr, { waitConfirm: false })
+  const approveHash = await ensureAllowance(wallet, tokenInfo.address, balAfter, tr, { waitConfirm: false, gwei })
     .catch(() => null);
 
   return {
@@ -271,15 +296,28 @@ export async function executeSell(wallet, tokenInfo, percent, slippage, gwei, tr
   const amountIn = (balance * BigInt(percent)) / 100n;
   if (amountIn === 0n) throw new Error('Cantidad a vender = 0');
 
-  // Allowance y construcción de la tx EN PARALELO. Si hace falta approve,
-  // ensureAllowance lo envía y espera adentro → al resolver, ya está aprobado
-  // ANTES de mandar la venta (orden correcto garantizado).
   const path = [tokenInfo.address, config.WBNB];
-  const [approveHash, tx, bnbBefore] = await Promise.all([
-    ensureAllowance(wallet, tokenInfo.address, amountIn, tr),
-    buildSwapV2Tx({ amountIn, decimals: tokenInfo.decimals, path, gwei, slippage, side: 'sell', wallet, tr }),
-    wallet.provider.getBalance(wallet.address),
-  ]);
+  const preApproved = approvedCache.has(akey(wallet.address, tokenInfo.address));
+
+  let approveHash = null;
+  let tx, bnbBefore;
+  if (preApproved) {
+    // Caso común (token aprobado al comprar): allowance no manda tx → 0 nonce
+    // consumido → seguro paralelizar build + balance.
+    [approveHash, tx, bnbBefore] = await Promise.all([
+      ensureAllowance(wallet, tokenInfo.address, amountIn, tr, { gwei }),
+      buildSwapV2Tx({ amountIn, decimals: tokenInfo.decimals, path, gwei, slippage, side: 'sell', wallet, tr }),
+      wallet.provider.getBalance(wallet.address),
+    ]);
+  } else {
+    // Token NO aprobado (raro, p.ej. comprado en otro bot): secuencial para
+    // que el approve tome nonce N y la venta N+1 (evita colisión de nonce).
+    approveHash = await ensureAllowance(wallet, tokenInfo.address, amountIn, tr, { gwei });
+    [tx, bnbBefore] = await Promise.all([
+      buildSwapV2Tx({ amountIn, decimals: tokenInfo.decimals, path, gwei, slippage, side: 'sell', wallet, tr }),
+      wallet.provider.getBalance(wallet.address),
+    ]);
+  }
   const sent = await signAndSend(wallet, tx, tr);
   const receipt = await sent.wait(1);
   const bnbAfter = await wallet.provider.getBalance(wallet.address);
