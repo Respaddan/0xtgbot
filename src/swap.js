@@ -3,6 +3,54 @@ import Decimal from 'decimal.js';
 import { config } from './config.js';
 import { ERC20_ABI, ROUTER_V2_ABI } from './abis.js';
 import { getReadProvider, getWriteProvider } from './chain.js';
+import { sendBundle } from './relays.js';
+
+/**
+ * Firma la tx localmente y la envía:
+ *  - si useBundle: eth_sendBundle a los relays MEV (tx privada, anti-sandwich)
+ *  - si no, o como fallback: mempool público
+ * Devuelve { hash, wait } compatible con el flujo anterior.
+ */
+async function signAndSend(wallet, tx) {
+  const provider = getWriteProvider();
+  const full = { ...tx, type: 0 }; // BSC = legacy (type 0)
+  delete full.from;
+
+  const raw = await wallet.signTransaction(full);
+  const hash = ethers.Transaction.from(raw).hash;
+
+  if (config.useBundle) {
+    const blk = await provider.getBlockNumber();
+    const info = await sendBundle([raw], blk, config.bundleBlocks);
+    console.log(`[bundle] ${hash} → ${info.accepted.join(', ')} (maxBlock ${info.maxBlock})`);
+
+    // Fallback consciente de bloques: en cuanto el bloque actual supera la
+    // ventana del bundle sin haber entrado, manda al mempool público YA.
+    if (config.bundlePublicFallback) {
+      (async () => {
+        const hardLimit = Date.now() + config.bundleFallbackMs + 2000;
+        while (Date.now() < hardLimit) {
+          await new Promise((r) => setTimeout(r, 300));
+          try {
+            if (await provider.getTransactionReceipt(hash)) return; // ya entró
+            if ((await provider.getBlockNumber()) > info.maxBlock) {
+              await provider.broadcastTransaction(raw).catch(() => {});
+              console.log(`[bundle] fallback público (ventana agotada): ${hash}`);
+              return;
+            }
+          } catch { /* reintenta */ }
+        }
+      })();
+    }
+  } else {
+    await provider.broadcastTransaction(raw);
+  }
+
+  return {
+    hash,
+    wait: (conf = 1) => provider.waitForTransaction(hash, conf, 90_000),
+  };
+}
 
 // Métodos del router según si el lado "quote" es el token nativo (WBNB)
 const METHODS = {
@@ -91,7 +139,7 @@ export async function executeBuy(wallet, tokenInfo, amountBnb, slippage, gwei) {
     token.balanceOf(wallet.address).catch(() => 0n),
     buildSwapV2Tx({ amountIn, decimals: 18, path, gwei, slippage, side: 'buy', wallet }),
   ]);
-  const sent = await wallet.sendTransaction(tx);
+  const sent = await signAndSend(wallet, tx);
   await sent.wait(1);
   const balAfter = await token.balanceOf(wallet.address).catch(() => balBefore);
 
@@ -128,7 +176,7 @@ export async function executeSell(wallet, tokenInfo, percent, slippage, gwei) {
   const tx = await buildSwapV2Tx({
     amountIn, decimals: tokenInfo.decimals, path, gwei, slippage, side: 'sell', wallet,
   });
-  const sent = await wallet.sendTransaction(tx);
+  const sent = await signAndSend(wallet, tx);
   const receipt = await sent.wait(1);
   const bnbAfter = await wallet.provider.getBalance(wallet.address);
 

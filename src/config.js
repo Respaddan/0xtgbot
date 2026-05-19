@@ -20,6 +20,26 @@ export const config = {
   // Respaldo de LECTURA si el WSS se cuelga (publicnode también sirve por https)
   httpReadRpc: process.env.HTTP_READ_RPC || 'https://bsc-rpc.publicnode.com',
 
+  // --- Envío de tx en BUNDLE (firma local + eth_sendBundle a relays MEV) ---
+  useBundle: process.env.USE_BUNDLE !== 'false',          // default: activado
+  bundleBlocks: Number(process.env.BUNDLE_BLOCKS || 2),   // ventana maxBlockNumber = bloque + N
+  // Duración de bloque en BSC (~0.75s post-Maxwell). Para calcular el fallback.
+  blockMs: Number(process.env.BSC_BLOCK_MS || 750),
+  relays: {
+    blockRazor: process.env.BLOCKRAZOR_URL || 'https://rpc.blockrazor.builders',
+    puissant: process.env.PUISSANT_URL || 'https://puissant-bsc.48.club',
+  },
+  // Si el bundle no entra en su ventana, reenvía la MISMA tx firmada al
+  // mempool público para no perder la operación (reintroduce algo de riesgo
+  // MEV; ponlo en 'false' para bundle estricto).
+  bundlePublicFallback: process.env.BUNDLE_PUBLIC_FALLBACK !== 'false',
+  // Por defecto = duración de la ventana del bundle (N bloques) + 1 bloque de
+  // margen. Override explícito con BUNDLE_FALLBACK_MS.
+  bundleFallbackMs: Number(
+    process.env.BUNDLE_FALLBACK_MS ||
+    (Number(process.env.BUNDLE_BLOCKS || 2) + 1) * Number(process.env.BSC_BLOCK_MS || 750)
+  ),
+
   chainId: 56,
 
   // Direcciones BSC / PancakeSwap V2
