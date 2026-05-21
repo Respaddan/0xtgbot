@@ -10,17 +10,21 @@ function save(o) {
   writeFileSync(STORE, JSON.stringify(o, null, 2), { mode: 0o600 });
 }
 
-const keyOf = (userId, token) => `${userId}:${token.toLowerCase()}`;
+// Clave por (userId, wallet, token) → PnL consistente por wallet, no se mezcla
+// entre W1/W2/W3 aunque compres el mismo token con varias.
+const keyOf = (userId, wallet, token) =>
+  `${userId}:${(wallet || '').toLowerCase()}:${token.toLowerCase()}`;
 
 // Posición: lo comprado/vendido VÍA ESTE BOT (para poder calcular PnL).
 // { bnbIn, tokensIn, bnbOut, tokensOut }
-export function getPosition(userId, token) {
-  return load()[keyOf(userId, token)] || null;
+export function getPosition(userId, wallet, token) {
+  if (!wallet) return null;
+  return load()[keyOf(userId, wallet, token)] || null;
 }
 
-export function recordBuy(userId, token, bnbSpent, tokensReceived) {
+export function recordBuy(userId, wallet, token, bnbSpent, tokensReceived) {
   const o = load();
-  const k = keyOf(userId, token);
+  const k = keyOf(userId, wallet, token);
   const p = o[k] || { bnbIn: 0, tokensIn: 0, bnbOut: 0, tokensOut: 0 };
   p.bnbIn += Number(bnbSpent);
   p.tokensIn += Number(tokensReceived);
@@ -29,9 +33,9 @@ export function recordBuy(userId, token, bnbSpent, tokensReceived) {
   return p;
 }
 
-export function recordSell(userId, token, tokensSold, bnbReceived) {
+export function recordSell(userId, wallet, token, tokensSold, bnbReceived) {
   const o = load();
-  const k = keyOf(userId, token);
+  const k = keyOf(userId, wallet, token);
   const p = o[k] || { bnbIn: 0, tokensIn: 0, bnbOut: 0, tokensOut: 0 };
   p.bnbOut += Number(bnbReceived);
   p.tokensOut += Number(tokensSold);
@@ -40,9 +44,9 @@ export function recordSell(userId, token, tokensSold, bnbReceived) {
   return p;
 }
 
-export function resetPosition(userId, token) {
+export function resetPosition(userId, wallet, token) {
   const o = load();
-  delete o[keyOf(userId, token)];
+  delete o[keyOf(userId, wallet, token)];
   save(o);
 }
 

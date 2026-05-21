@@ -165,6 +165,30 @@ async function multicall(calls) {
   });
 }
 
+// Balances (BNB + token) de varias wallets en UN solo multicall.
+// Devuelve [{ address, bnb, tokenBalRaw, tokenBal }, ...]
+export async function getMultiWalletBalances(addresses, tokenAddr, decimals = 18) {
+  if (!addresses?.length) return [];
+  const calls = [];
+  for (const a of addresses) {
+    calls.push({ target: MULTICALL3, iface: iMc3, fn: 'getEthBalance', args: [a], def: 0n });
+    calls.push({ target: tokenAddr, iface: iErc20, fn: 'balanceOf', args: [a], def: 0n });
+  }
+  const r = await multicall(calls);
+  const out = [];
+  for (let i = 0; i < addresses.length; i++) {
+    const wei = r[i * 2] ?? 0n;
+    const tokRaw = r[i * 2 + 1] ?? 0n;
+    out.push({
+      address: addresses[i],
+      bnb: new Decimal(wei.toString()).div('1e18').toNumber(),
+      tokenBalRaw: tokRaw,
+      tokenBal: new Decimal(tokRaw.toString()).div(`1e${decimals}`).toNumber(),
+    });
+  }
+  return out;
+}
+
 // Dirección del par V2 por CREATE2 (sin preguntar al Factory).
 export function pairFor(a, b) {
   const [t0, t1] = a.toLowerCase() < b.toLowerCase() ? [a, b] : [b, a];

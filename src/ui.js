@@ -63,25 +63,49 @@ export function renderPanel(info, state) {
     `⚖️ Cost: B ${fmtCost(costBuy)} | S ${fmtCost(costSell)}`,
   ];
 
-  // --- Wallet / posición ---
-  lines.push('', `👛 ${config.walletLabel}: ${fmtBnb(info.walletBnb || 0)} BNB`);
-
-  if (info.tokenBal > 0) {
-    const valBnb = info.tokenBal * (info.priceBnb || 0);
-    const valUsd = info.tokenBal * (info.priceUsd || 0);
-    lines.push(`📦 ${info.symbol}: ${fmtAmt(info.tokenBal)} (≈ ${fmtBnb(valBnb)} BNB | ${fmtUsd(valUsd)})`);
-  }
-
-  const pnl = state.pnl;
-  if (pnl && pnl.heldTracked > 0 && pnl.unrealPct != null) {
-    const arrow = pnl.unrealPct >= 0 ? '🟢' : '🔴';
-    lines.push(
-      `📈 PnL: ${arrow} ${sign(pnl.unrealPct)}${pnl.unrealPct.toFixed(2)}% ` +
-      `(${sign(pnl.unrealBnb)}${fmtBnb(pnl.unrealBnb)} BNB)`
-    );
-  }
-  if (pnl && pnl.realizedBnb > 0) {
-    lines.push(`💰 Realizado: ${fmtBnb(pnl.realizedBnb)} BNB`);
+  // --- Wallets activas (un bloque por cada una) ---
+  const winfo = state.walletsInfo || [];
+  if (winfo.length) {
+    lines.push('');
+    winfo.forEach((w, k) => {
+      if (k > 0) lines.push(''); // separador entre wallets
+      lines.push(`👛 *${w.label}*: ${fmtBnb(w.bnb)} BNB`);
+      if (w.tokenBal > 0) {
+        const valBnb = w.tokenBal * (info.priceBnb || 0);
+        const valUsd = w.tokenBal * (info.priceUsd || 0);
+        lines.push(`📦 ${info.symbol}: ${fmtAmt(w.tokenBal)} (≈ ${fmtBnb(valBnb)} BNB | ${fmtUsd(valUsd)})`);
+      }
+      const pnl = w.pnl;
+      if (pnl && pnl.heldTracked > 0 && pnl.unrealPct != null) {
+        const arrow = pnl.unrealPct >= 0 ? '🟢' : '🔴';
+        lines.push(
+          `📈 PnL: ${arrow} ${sign(pnl.unrealPct)}${pnl.unrealPct.toFixed(2)}% ` +
+          `(${sign(pnl.unrealBnb)}${fmtBnb(pnl.unrealBnb)} BNB)`
+        );
+      }
+      if (pnl && pnl.realizedBnb > 0) {
+        lines.push(`💰 Realizado: ${fmtBnb(pnl.realizedBnb)} BNB`);
+      }
+    });
+  } else {
+    // Fallback (sin wallets activas en estado) — info del único wallet pasado.
+    lines.push('', `👛 ${config.walletLabel}: ${fmtBnb(info.walletBnb || 0)} BNB`);
+    if (info.tokenBal > 0) {
+      const valBnb = info.tokenBal * (info.priceBnb || 0);
+      const valUsd = info.tokenBal * (info.priceUsd || 0);
+      lines.push(`📦 ${info.symbol}: ${fmtAmt(info.tokenBal)} (≈ ${fmtBnb(valBnb)} BNB | ${fmtUsd(valUsd)})`);
+    }
+    const pnl = state.pnl;
+    if (pnl && pnl.heldTracked > 0 && pnl.unrealPct != null) {
+      const arrow = pnl.unrealPct >= 0 ? '🟢' : '🔴';
+      lines.push(
+        `📈 PnL: ${arrow} ${sign(pnl.unrealPct)}${pnl.unrealPct.toFixed(2)}% ` +
+        `(${sign(pnl.unrealBnb)}${fmtBnb(pnl.unrealBnb)} BNB)`
+      );
+    }
+    if (pnl && pnl.realizedBnb > 0) {
+      lines.push(`💰 Realizado: ${fmtBnb(pnl.realizedBnb)} BNB`);
+    }
   }
 
   lines.push('', `[Gmgn](${config.links.gmgn(t)}) | [DeX](${config.links.dexscreener(t)}) | [Based](${config.links.based(t)})`);
@@ -156,6 +180,17 @@ export function renderKeyboard(state) {
     rows.push(opCells.slice(i, i + 3));
   }
 
+  // Toggles W1/W2/W3: 🟢 = activa para operar, 🔴 = inactiva.
+  // Las operaciones se ejecutan en PARALELO con todas las activas.
+  const wallets = (state.wallets || []).slice(0, 3);
+  const activeSet = state.activeWallets instanceof Set
+    ? state.activeWallets
+    : new Set(state.activeWallets || []);
+  if (wallets.length) {
+    rows.push(wallets.map((w, i) =>
+      btn(`${activeSet.has(i) ? '🟢' : '🔴'} ${w.label}`, `wsel:${i}`)));
+  }
+
   // Slippage compra / venta (color original de Telegram)
   rows.push([
     btn(`📊 B Slip ${state.slipBuy}%`, 'slipBuy'),
@@ -168,5 +203,53 @@ export function renderKeyboard(state) {
     btn('🗑', 'del', 'danger'),
   ]);
 
+  return Markup.inlineKeyboard(rows);
+}
+
+// ============================================================
+//  PANEL DE WALLETS
+// ============================================================
+
+export function renderWalletsPanel({ list, active, balances }) {
+  if (!list.length) {
+    return '*👛 Wallets*\n\nNo tienes wallets configuradas.\nUsa el botón *🆕 New Wallet* o *🔑 Import a wallet* abajo.';
+  }
+  const lines = ['*👛 Wallets*', ''];
+  list.forEach((w, i) => {
+    const mark = i === active ? '⭐' : '  ';
+    const bal = balances?.[i] != null ? `  —  ${fmtBnb(balances[i])} BNB` : '';
+    lines.push(`${mark} *${w.label}*  \`${w.address}\`${bal}`);
+  });
+  lines.push('', `_Activa: *${list[active]?.label || '—'}*_`);
+  return lines.join('\n');
+}
+
+export function renderWalletsKeyboard() {
+  const rows = [
+    [btn('🔑 Import a wallet', 'w:import'), btn('⭐ Preferred Wallet', 'w:pref')],
+    [btn('📤 Export private key', 'w:export'), btn('🗑 Delete wallet', 'w:remove', 'danger')],
+    [btn('🚀 Transfer Token', 'w:txfer')],
+    [btn('🆕 New Wallet', 'w:new', 'success')],
+    [btn('✖ Close', 'w:close', 'danger'), btn('🔄 Refresh', 'w:refresh')],
+  ];
+  return Markup.inlineKeyboard(rows);
+}
+
+// Sub-panel para elegir wallet activa.
+export function renderPreferredPanel(list) {
+  return ['*⭐ Elige wallet activa*', '', ...list.map((w, i) => `${i + 1}. *${w.label}*  \`${w.address}\``)].join('\n');
+}
+export function renderPreferredKeyboard(list, active) {
+  const rows = [];
+  for (let i = 0; i < list.length; i += 2) {
+    rows.push(
+      list.slice(i, i + 2).map((w, k) => {
+        const idx = i + k;
+        const mark = idx === active ? '⭐ ' : '';
+        return btn(`${mark}${w.label}`, `w:pref:${idx}`);
+      })
+    );
+  }
+  rows.push([btn('« Volver', 'w:refresh')]);
   return Markup.inlineKeyboard(rows);
 }

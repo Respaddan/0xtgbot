@@ -56,14 +56,36 @@ export async function sendBundle(txs, currentBlock, plusBlock = config.bundleBlo
      .catch((e) => { errs.push(e?.message || String(e)); throw e; })
   );
 
+  // Objeto de resultado: el simulatedRevertHint se actualiza después si
+  // un relay reporta que la tx revertiría (background tracker).
+  const result = { accepted: [], maxBlock, simulatedRevertHint: false };
+
+  // Tracker tardío: detecta señales de "tx va a revertir" en cualquier relay.
+  Promise.allSettled(tracked).then(() => {
+    if (errs.some(isRevertSimError)) result.simulatedRevertHint = true;
+    if (errs.length) console.warn('[bundle] relay(s) con error:', errs.join(' | '));
+  });
+
   try {
     const first = await Promise.any(tracked);
-    // Los otros relays terminan en background (logueamos errores tardíos).
-    Promise.allSettled(tracked).then(() => {
-      if (errs.length) console.warn('[bundle] relay(s) con error:', errs.join(' | '));
-    });
-    return { accepted: [first.relay], maxBlock };
+    result.accepted = [first.relay];
+    return result;
   } catch {
-    throw new Error(`Ningún relay aceptó el bundle: ${errs.join(' | ')}`);
+    // TODOS los relays fallaron. Si todos por revert-sim → hint=true.
+    if (errs.length && errs.every(isRevertSimError)) result.simulatedRevertHint = true;
+    const err = new Error(`Ningún relay aceptó el bundle: ${errs.join(' | ')}`);
+    err.simulatedRevertHint = result.simulatedRevertHint;
+    throw err;
   }
+}
+
+// Detecta mensajes de relay que indican que la tx revertiría al ejecutar.
+// BlockRazor: "non-reverting tx in bundle failed". Otros pueden decir
+// "execution reverted" / "would revert" / "would fail".
+function isRevertSimError(msg) {
+  const m = String(msg || '').toLowerCase();
+  return m.includes('non-reverting tx in bundle failed') ||
+         m.includes('execution reverted') ||
+         m.includes('would revert') ||
+         m.includes('would fail');
 }

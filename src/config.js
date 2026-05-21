@@ -28,10 +28,13 @@ export const config = {
   // Tras cuántos bloques (observados) disparamos el fallback público.
   // Independiente de bundleBlocks → el fallback sigue siendo rápido.
   bundleFallbackBlocks: Number(process.env.BUNDLE_FALLBACK_BLOCKS || 1),
-  // Modo de fallback:
+  // Modo de fallback (afecta COMPRAS por defecto):
   //  'blocks'  -> espera N bloques (BUNDLE_FALLBACK_BLOCKS) y si no entró, público
-  //  'instant' -> manda a bundle Y a mempool público a la vez (máx velocidad, sin MEV)
+  //  'instant' -> manda a bundle Y a Protect RPC a la vez (máx velocidad)
   fallbackMode: (process.env.FALLBACK_MODE || 'blocks').trim().toLowerCase(),
+  // Override SOLO para ventas. Si no se setea, hereda fallbackMode.
+  // Recomendado: 'instant' para salir lo antes posible (sells rara vez son MEV).
+  fallbackModeSell: (process.env.FALLBACK_MODE_SELL || process.env.FALLBACK_MODE || 'blocks').trim().toLowerCase(),
   // Duración de bloque en BSC (~0.75s post-Maxwell). Para calcular el fallback.
   blockMs: Number(process.env.BSC_BLOCK_MS || 750),
   relays: {
@@ -72,8 +75,8 @@ export const config = {
 
   // Valores por defecto del panel
   defaults: {
-    slippageBuy: 10,   // %
-    slippageSell: 10,  // %
+    slippageBuy: 40,   // %
+    slippageSell: 50,  // %
     gwei: 0.15,
   },
 

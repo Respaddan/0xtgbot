@@ -27,8 +27,9 @@ async function waitForReceipt(provider, hash, timeoutMs = 90_000) {
  *  - si no, o como fallback: mempool público
  * Devuelve { hash, wait } compatible con el flujo anterior.
  */
-async function signAndSend(wallet, tx, tr = noTrace) {
+async function signAndSend(wallet, tx, tr = noTrace, { instant } = {}) {
   const rp = getWriteProvider();        // blxrbdn: lecturas/espera/envío (más rápido + Protect)
+  const useInstant = instant != null ? instant : (config.fallbackMode === 'instant');
   const full = { ...tx, type: 0 };      // BSC = legacy (type 0)
   delete full.from;
 
@@ -41,43 +42,75 @@ async function signAndSend(wallet, tx, tr = noTrace) {
   // Cómo terminó entrando la tx (para el log al confirmar).
   const route = { via: null, accepted: [] };
   let submitBlock = 0;
+  // Hoisted: el watcher y el return de abajo lo leen — sin esto, fallaba
+  // por scope cuando NO se usaba bundle o tras salir del if.
+  let info = { accepted: [], maxBlock: 0, simulatedRevertHint: false };
 
   if (config.useBundle) {
     const blk = await getCachedBlockNumber();   // 0 RPC: cache del watcher
     submitBlock = blk;
     tr.log(`enviando bundle a relays (bloque ${blk})`);
-    const info = await sendBundle([raw], blk, config.bundleBlocks);
-    route.accepted = info.accepted;
-    tr.log(`bundle aceptado por: ${info.accepted.join(', ') || 'ninguno'}`);
-    console.log(`[bundle] enviado ${hash} | nonce ${nonce} | aceptado por ${info.accepted.join(', ')} (bloque ${blk}, maxBlock ${info.maxBlock})`);
+    let bundleAccepted = false;
+    try {
+      info = await sendBundle([raw], blk, config.bundleBlocks);
+      bundleAccepted = true;
+    } catch (e) {
+      // Si TODOS los relays rechazaron por revert simulado → cancelamos todo
+      // (no broadcast, ahorra gas). Si fallaron por otra cosa → relanzamos.
+      if (e.simulatedRevertHint) {
+        info.simulatedRevertHint = true;
+        route.via = 'simulated-revert (todos los relays, gas ahorrado)';
+        route.cancelled = true;
+        tr.log('⛔ TODOS los relays simularon revert → tx NO enviada (ahorro de gas)');
+        console.log(`[bundle] ⛔ todos los relays simularon revert → tx no enviada: ${hash}`);
+      } else {
+        throw e;
+      }
+    }
+    if (bundleAccepted) {
+      route.accepted = info.accepted;
+      tr.log(`bundle aceptado por: ${info.accepted.join(', ') || 'ninguno'}`);
+      console.log(`[bundle] enviado ${hash} | nonce ${nonce} | aceptado por ${info.accepted.join(', ')} (bloque ${blk}, maxBlock ${info.maxBlock})`);
 
-    if (config.fallbackMode === 'instant') {
-      // MÁX VELOCIDAD: en paralelo al bundle, vía blxrbdn Protect RPC
-      // (BSC Chain 56) → NO va al mempool P2P público, sigue MEV-protegido.
-      route.via = 'bundle + blxrbdn Protect (instant)';
-      await rp.broadcastTransaction(raw).catch(() => {});
-      tr.log('instant: enviado también vía blxrbdn Protect RPC');
-      console.log(`[bundle] ⚡ instant: enviado también vía blxrbdn Protect RPC: ${hash}`);
-    } else if (config.bundlePublicFallback) {
-      // Fallback rápido: a los N bloques observados, sin esperar al maxBlock.
-      const fallbackAt = blk + config.bundleFallbackBlocks;
-      (async () => {
-        const hardLimit = Date.now() + config.bundleFallbackMs + 3000;
-        while (Date.now() < hardLimit) {
-          await new Promise((r) => setTimeout(r, 300));
-          try {
-            if (await rp.getTransactionReceipt(hash)) return; // ya entró (bundle)
-            const cur = await getCachedBlockNumber();
-            if (cur > fallbackAt) {
-              route.via = 'fallback blxrbdn Protect';
-              await rp.broadcastTransaction(raw).catch(() => {});
-              tr.log(`no entró en ${config.bundleFallbackBlocks} bloque(s) → fallback blxrbdn Protect`);
-              console.log(`[bundle] ⏬ no entró en ${config.bundleFallbackBlocks} bloque(s), fallback vía blxrbdn Protect RPC: ${hash}`);
-              return;
-            }
-          } catch { /* reintenta */ }
-        }
-      })();
+      if (useInstant) {
+        // MÁX VELOCIDAD: en paralelo al bundle, vía blxrbdn Protect RPC
+        // (BSC Chain 56) → NO va al mempool P2P público, sigue MEV-protegido.
+        route.via = 'bundle + blxrbdn Protect (instant)';
+        await rp.broadcastTransaction(raw).catch(() => {});
+        tr.log('instant: enviado también vía blxrbdn Protect RPC');
+        console.log(`[bundle] ⚡ instant: enviado también vía blxrbdn Protect RPC: ${hash}`);
+      } else if (config.bundlePublicFallback) {
+        // Fallback rápido: a los N bloques observados, sin esperar al maxBlock.
+        // PERO si algún relay simula que la tx va a revertir → cancela el
+        // fallback para no quemar gas en una tx condenada.
+        const fallbackAt = blk + config.bundleFallbackBlocks;
+        (async () => {
+          const hardLimit = Date.now() + config.bundleFallbackMs + 3000;
+          while (Date.now() < hardLimit) {
+            await new Promise((r) => setTimeout(r, 300));
+            try {
+              if (await rp.getTransactionReceipt(hash)) return; // ya entró (bundle)
+
+              if (info.simulatedRevertHint) {
+                route.via = 'simulated-revert (fallback cancelado, gas ahorrado)';
+                route.cancelled = true;
+                tr.log('⛔ relay simuló revert → fallback público CANCELADO (ahorra gas)');
+                console.log(`[bundle] ⛔ relay simuló revert → NO fallback (ahorro de gas): ${hash}`);
+                return;
+              }
+
+              const cur = await getCachedBlockNumber();
+              if (cur > fallbackAt) {
+                route.via = 'fallback blxrbdn Protect';
+                await rp.broadcastTransaction(raw).catch(() => {});
+                tr.log(`no entró en ${config.bundleFallbackBlocks} bloque(s) → fallback blxrbdn Protect`);
+                console.log(`[bundle] ⏬ no entró en ${config.bundleFallbackBlocks} bloque(s), fallback vía blxrbdn Protect RPC: ${hash}`);
+                return;
+              }
+            } catch { /* reintenta */ }
+          }
+        })();
+      }
     }
   } else {
     route.via = 'blxrbdn Protect (sin bundle)';
@@ -89,24 +122,26 @@ async function signAndSend(wallet, tx, tr = noTrace) {
   return {
     hash,
     nonce,
+    route, // expuesto para que el caller pueda leer route.cancelled / .via
+    info,  // expuesto: simulatedRevertHint vive aquí
     wait: async () => {
-      const r = await waitForReceipt(rp, hash, 90_000);
+      // Espera el receipt, pero si el fallback fue cancelado por revert
+      // simulado, acorta el timeout (no tiene sentido esperar 90s).
+      const maxMs = (route.cancelled || info.simulatedRevertHint)
+        ? Math.max(2000, (config.bundleBlocks + 2) * config.blockMs)
+        : 90_000;
+      const r = await waitForReceipt(rp, hash, maxMs);
       if (r) {
         let via;
-        if (route.via) {
-          via = route.via; // 'fallback público' o 'mempool (sin bundle)'
-        } else if (route.accepted.length === 1) {
-          via = `bundle ✅ ${route.accepted[0]}`; // solo un relay aceptó → atribuible
-        } else {
-          via = `bundle ✅ ${route.accepted.join('/')} (no atribuible a uno)`;
-        }
-        const ok = r.status === 1 ? 'OK' : 'REVERTED ⚠️';
-        const pos = r.index ?? r.transactionIndex; // posición de la tx en el bloque
-        const delta = submitBlock ? r.blockNumber - submitBlock : null;
+        if (route.via) via = route.via;
+        else if (route.accepted.length === 1) via = `bundle ✅ ${route.accepted[0]}`;
+        else via = `bundle ✅ ${route.accepted.join('/')} (no atribuible a uno)`;
 
-        // Solo en modo instant: heurística (NO certeza) de por dónde entró.
+        const ok = r.status === 1 ? 'OK' : 'REVERTED ⚠️';
+        const pos = r.index ?? r.transactionIndex;
+        const delta = submitBlock ? r.blockNumber - submitBlock : null;
         let guess = '';
-        if (config.fallbackMode === 'instant' && config.useBundle) {
+        if (useInstant && config.useBundle) {
           const likelyBundle = delta != null && delta <= 1 && pos <= 8;
           guess = likelyBundle
             ? ' | ≈probable BUNDLE relay (rápido + pos baja, heurística)'
@@ -115,6 +150,9 @@ async function signAndSend(wallet, tx, tr = noTrace) {
         const dly = delta != null ? ` | +${delta} bloque(s)` : '';
         tr.log(`tx CONFIRMADA (${ok}) vía ${via} | bloque ${r.blockNumber}${dly} | pos ${pos}`);
         console.log(`[tx] confirmada vía ${via} | nonce ${nonce} | bloque ${r.blockNumber}${dly} | pos ${pos} en bloque | ${ok}${guess} | ${hash}`);
+      } else if (route.cancelled || info.simulatedRevertHint) {
+        tr.log('tx NO ejecutada (relay simuló revert) — gas ahorrado');
+        console.log(`[tx] ⛔ NO ejecutada (relay simuló revert): ${hash} | nonce ${nonce}`);
       } else {
         tr.log('SIN receipt tras timeout (90s)');
         console.log(`[tx] ⚠️ sin receipt tras timeout: ${hash} | nonce ${nonce}`);
@@ -264,12 +302,21 @@ export async function executeBuy(wallet, tokenInfo, amountBnb, slippage, gwei, t
     buildSwapV2Tx({ amountIn, decimals: 18, path, gwei, slippage, side: 'buy', wallet, tr }),
   ]);
   const sent = await signAndSend(wallet, tx, tr);
-  await sent.wait(1);
+  const receipt = await sent.wait(1);
   const balAfter = await token.balanceOf(wallet.address).catch(() => balBefore);
 
   const received = new Decimal((balAfter - balBefore).toString())
     .div(`1e${tokenInfo.decimals}`).toNumber();
   tr.log(`tokens recibidos: ${received}`);
+
+  // Si el relay simuló revert y no hubo tokens: error con causa probable.
+  if (received === 0 && (sent.route?.cancelled || sent.info?.simulatedRevertHint || receipt?.status === 0)) {
+    const err = new Error('La tx revertiría on-chain (relay lo simuló) o reverteó al ejecutar.');
+    err.code = 'SIMULATED_REVERT';
+    err.hash = sent.hash;
+    err.cancelled = !!sent.route?.cancelled;
+    throw err;
+  }
 
   // Approve post-compra SIN bloquear: confirma en background (la venta futura
   // igual queda preparada; si vendes antes de que mine, la venta lo resuelve).
@@ -318,7 +365,8 @@ export async function executeSell(wallet, tokenInfo, percent, slippage, gwei, tr
       wallet.provider.getBalance(wallet.address),
     ]);
   }
-  const sent = await signAndSend(wallet, tx, tr);
+  const sellInstant = config.fallbackModeSell === 'instant';
+  const sent = await signAndSend(wallet, tx, tr, { instant: sellInstant });
   const receipt = await sent.wait(1);
   const bnbAfter = await wallet.provider.getBalance(wallet.address);
 
@@ -329,6 +377,15 @@ export async function executeSell(wallet, tokenInfo, percent, slippage, gwei, tr
     .div('1e18').toNumber();
   const tokensSold = new Decimal(amountIn.toString())
     .div(`1e${tokenInfo.decimals}`).toNumber();
+
+  // Si revertió o el relay simuló revert sin que entrara BNB: error claro.
+  if (bnbReceived === 0 && (sent.route?.cancelled || sent.info?.simulatedRevertHint || receipt?.status === 0)) {
+    const err = new Error('La tx revertiría on-chain (relay lo simuló) o reverteó al ejecutar.');
+    err.code = 'SIMULATED_REVERT';
+    err.hash = sent.hash;
+    err.cancelled = !!sent.route?.cancelled;
+    throw err;
+  }
 
   return { hash: sent.hash, approveHash, bnbReceived, tokensSold, soldAll: percent >= 100 };
 }
